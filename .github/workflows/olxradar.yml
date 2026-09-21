@@ -16,6 +16,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Przywroc baze OLXRadar
+        uses: actions/cache/restore@v4
+        with:
+          path: database.db
+          key: olxradar-database-${{ github.run_id }}
+          restore-keys: |
+            olxradar-database-
+
       - name: Zainstaluj zaleznosci
         run: pip install -r requirements.txt
 
@@ -24,4 +32,13 @@ jobs:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
+
+      - name: Zapisz baze OLXRadar
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: database.db
+          key: olxradar-database-${{ github.run_id }}
