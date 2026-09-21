@@ -3,7 +3,7 @@ name: OLXRadar
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+- cron: "2/5 * * * *"
 
 jobs:
   run-radar:
