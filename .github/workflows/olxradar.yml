@@ -2,8 +2,8 @@ name: OLXRadar
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/10 * * * *"
+schedule:
+  - cron: "*/5 * * * *"
 jobs:
   run-radar:
     runs-on: ubuntu-latest
