@@ -2,6 +2,7 @@ import os
 import re
 import unicodedata
 import random
+from urllib.parse import unquote
 
 # Absolute path of the project dir
 BASE_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -89,7 +90,7 @@ def extract_search_term(url: str) -> str:
     # In OLX.ro urls, the search term is preceded by '/q-' and followed by '/'.
     match = re.search(r"(?<=(/q-))[\S-]+(?=/)", url, re.IGNORECASE)
     if match:
-        query = match.group()
+        query = unquote(match.group())
         query_segments = query.split("-")
         return " ".join(query_segments)
     return None
