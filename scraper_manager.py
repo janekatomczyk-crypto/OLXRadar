@@ -1,216 +1,337 @@
 import re
-import requests
 import logging
 import logging_config
-from multiprocessing import Pool
-from urllib.parse import urlparse
+
+from curl_cffi import requests
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from bs4 import BeautifulSoup, ResultSet, Tag
 from utils import get_header
 
 
 class OlxScraper:
-    """Class used to scrape data from OLX Romania."""
+    """Scraper used to monitor listings on OLX.pl."""
 
     def __init__(self):
         self.headers = get_header()
-        self.netloc = "www.olx.ro"
+        self.netloc = "www.olx.pl"
         self.schema = "https"
         self.current_page = 1
         self.last_page = None
 
     def parse_content(self, target_url: str) -> BeautifulSoup:
         """
-        Parse content from a given URL.
-
-        Args:
-            target_url (str): A string representing the URL to be processed.
-
-        Returns:
-            BeautifulSoup: An object representing the processed content,
-            or None in case of error.
+        Download and parse an OLX page.
         """
         try:
-            r = requests.get(target_url, headers=self.headers, timeout=60)
+            r = requests.get(
+                target_url,
+                headers=self.headers,
+                impersonate="chrome",
+                timeout=60
+            )
             r.raise_for_status()
-        except requests.exceptions.RequestException as error:
+
+        except Exception as error:
             logging.error(f"Connection error: {error}")
-        else:
-            parsed_content = BeautifulSoup(r.text, "html.parser")
-            return parsed_content
+            return None
+
+        return BeautifulSoup(r.text, "html.parser")
 
     def get_ads(self, parsed_content: BeautifulSoup) -> ResultSet[Tag]:
         """
-        Returns all ads found on the parsed web page.
-
-        Args:
-            parsed_content (BeautifulSoup): a BeautifulSoup object created as
-            a result of parsing the web page.
-
-        Returns:
-            ResultSet[Tag]: A ResultSet containing all HTML tags that contain ads.
+        Find listing cards on an OLX search results page.
         """
         if parsed_content is None:
-            return None
-        ads = parsed_content.select("div.css-1sw7q4x")
-        return ads
+            return []
+
+        return parsed_content.select(
+            'div[data-testid="l-card"], div[data-cy="l-card"]'
+        )
 
     def get_last_page(self, parsed_content: BeautifulSoup) -> int:
         """
-        Returns the number of the last page available for processing.
-
-        Args:
-            parsed_content (BeautifulSoup): a BeautifulSoup object created
-            as a result of parsing the web page.
-
-        Returns:
-            int: The number of the last page available for parsing. If
-            there is no paging or the parsed object is None, it will return None.
+        Try to determine the last available results page.
         """
-        if parsed_content is not None:
-            pagination_ul = parsed_content.find("ul", class_="pagination-list")
-            if pagination_ul is not None:
-                pages = pagination_ul.find_all("li", class_="pagination-item")
-                if pages:
-                    return int(pages[-1].text)
+        if parsed_content is None:
+            return None
+
+        pagination_ul = parsed_content.find(
+            "ul",
+            class_="pagination-list"
+        )
+
+        if pagination_ul is not None:
+            pages = pagination_ul.find_all(
+                "li",
+                class_="pagination-item"
+            )
+
+            page_numbers = []
+
+            for page in pages:
+                text = page.get_text(strip=True)
+
+                if text.isdigit():
+                    page_numbers.append(int(text))
+
+            if page_numbers:
+                return max(page_numbers)
+
         return None
 
     def scrape_ads_urls(self, target_url: str) -> list:
         """
-        Scrapes the URLs of all valid ads present on an OLX page. Search all relevant
-        URLs of the ads and adds them to a set. Parses all pages, from first to last.
+        Find advertisement URLs in an OLX.pl search.
 
-        Args:
-            target_url (str): URL of the OLX page to start the search from.
-
-        Returns:
-            list: a list of relevant URLs of the ads found on the page.
-
-        Raises:
-            ValueError: If the URL is invalid or does not belong to the specified domain.
+        Existing search parameters such as price and sorting are preserved.
         """
         ads_links = set()
-        if self.netloc != urlparse(target_url).netloc:
+
+        self.current_page = 1
+        self.last_page = None
+
+        parsed_target = urlparse(target_url)
+
+        if parsed_target.netloc != self.netloc:
             raise ValueError(
-                f"Bad URL! OLXRadar is configured to process {self.netloc} links only.")
+                f"Bad URL! OLXRadar is configured to process "
+                f"{self.netloc} links only."
+            )
+
         while True:
-            url = f"{target_url}/?page={self.current_page}"
+            parsed_url = urlparse(target_url)
+
+            query = dict(
+                parse_qsl(
+                    parsed_url.query,
+                    keep_blank_values=True
+                )
+            )
+
+            query["page"] = str(self.current_page)
+
+            url = urlunparse(
+                parsed_url._replace(
+                    query=urlencode(query)
+                )
+            )
+
+            logging.info(
+                f"Processing search page: {url}"
+            )
+
             parsed_content = self.parse_content(url)
-            self.last_page = self.get_last_page(parsed_content)
-            ads = self.get_ads(parsed_content)
-            if ads is None:
-                return ads_links
-            for ad in ads:
-                link = ad.find("a", class_="css-rc5s2u")
-                if link is not None and link.has_attr("href"):
-                    link_href = link["href"]
-                    if not self.is_internal_url(link_href, self.netloc):
-                        continue
-                    if not self.is_relevant_url(link_href):
-                        continue
-                    if self.is_relative_url(link_href):
-                        link_href = f"{self.schema}://{self.netloc}{link_href}"
-                    ads_links.add(link_href)
-            if self.last_page is None or self.current_page >= self.last_page:
+
+            if parsed_content is None:
                 break
+
+            self.last_page = self.get_last_page(
+                parsed_content
+            )
+
+            ads = self.get_ads(parsed_content)
+
+            if not ads:
+                break
+
+            for ad in ads:
+                link = ad.find(
+                    "a",
+                    href=lambda href:
+                        href is not None
+                        and "/d/oferta/" in href
+                )
+
+                if link is None:
+                    continue
+
+                link_href = link.get("href")
+
+                if not link_href:
+                    continue
+
+                if not self.is_internal_url(
+                    link_href,
+                    self.netloc
+                ):
+                    continue
+
+                if not self.is_relevant_url(link_href):
+                    continue
+
+                if self.is_relative_url(link_href):
+                    link_href = (
+                        f"{self.schema}://"
+                        f"{self.netloc}"
+                        f"{link_href}"
+                    )
+
+                ads_links.add(link_href)
+
+            if (
+                self.last_page is None
+                or self.current_page >= self.last_page
+            ):
+                break
+
             self.current_page += 1
-        return ads_links
+
+        return list(ads_links)
 
     def is_relevant_url(self, url: str) -> bool:
         """
-        Determines whether a particular URL is relevant by analyzing the query segment it contains.
-
-        Args:
-            url (str): A string representing the URL whose relevance is to be checked.
-
-        Returns:
-            bool: True if the URL is relevant, False if not.
-
-        The query (or search) segments, such as "?reason=extended-region", show that the ad
-        is added to the search results list by OLX when there are not enough ads
-        available for the user's region. Therefore, such a URL is not useful
-        (relevant) for monitoring.
+        Check whether a URL points to an OLX advertisement.
         """
-        segments = urlparse(url)
-        if segments.query != "":
-            return False
-        return True
+        parsed_url = urlparse(url)
 
-    def is_internal_url(self, url: str, domain: str) -> bool:
+        return "/d/oferta/" in parsed_url.path
+
+    def is_internal_url(
+        self,
+        url: str,
+        domain: str
+    ) -> bool:
         """
-        Checks if the URL has the same domain as the page it was taken from.
-
-        Args:
-            url (str): the URL to check.
-            domain (str): Domain of the current page.
-
-        Returns:
-            bool: True if the URL is an internal link, False otherwise.
+        Check whether a URL belongs to OLX.pl
+        or is a relative URL.
         """
-        # URL starts with "/"
         if self.is_relative_url(url):
             return True
+
         parsed_url = urlparse(url)
-        if parsed_url.netloc == domain:
-            return True
-        return False
+
+        return parsed_url.netloc == domain
 
     def is_relative_url(self, url: str) -> bool:
         """
-        Check if the given url is relative or absolute.
-
-        Args:
-            url (str): url to check.
-
-        Returns:
-            True if the url is relative, otherwise False.
+        Check whether a URL is relative.
         """
-
         parsed_url = urlparse(url)
+
         if not parsed_url.netloc:
             return True
-        if re.search(r"^\/[\w.\-\/]+", url):
+
+        if re.search(r"^/[\w.\-/]+", url):
             return True
+
         return False
 
     def get_ad_data(self, ad_url: str) -> dict[str]:
         """
-        Extracts data from the HTML page of the ad.
-
-        Args:
-            ad_url (str): the URL of the ad.
-
-        Returns:
-            dict or None: A dictionary containing the scraped ad data
-            or None if the required information is missing.
+        Extract title, price and description
+        from an OLX.pl advertisement.
         """
-        logging.info(f"Processing {ad_url}")
+        logging.info(
+            f"Processing advertisement: {ad_url}"
+        )
+
         content = self.parse_content(ad_url)
 
         if content is None:
             return None
 
         title = None
-        if content.find("h1", class_="css-1soizd2"):
-            title = content.find(
-                "h1", class_="css-1soizd2").get_text(strip=True)
         price = None
-        if content.find("h3", class_="css-ddweki"):
-            price = content.find(
-                "h3", class_="css-ddweki").get_text(strip=True)
         description = None
-        if content.find("div", class_="css-bgzo2k"):
-            description = content.find(
-                "div", class_="css-bgzo2k").get_text(strip=True, separator="\n")
-        seller = None
-        if content.find("h4", class_="css-1lcz6o7"):
-            seller = content.find(
-                "h4", class_="css-1lcz6o7").get_text(strip=True)
-        if any(item is None for item in [title, price, description]):
+
+        # -------------------------
+        # TITLE
+        # -------------------------
+
+        og_title = content.find(
+            "meta",
+            property="og:title"
+        )
+
+        if og_title is not None:
+            title = og_title.get("content")
+
+            if title:
+                title = re.sub(
+                    r"\s*•\s*OLX\.pl\s*$",
+                    "",
+                    title
+                ).strip()
+
+        # Fallback if OLX changes og:title
+        if title is None:
+            title_element = content.find("h1")
+
+            if title_element is not None:
+                title = title_element.get_text(
+                    " ",
+                    strip=True
+                )
+
+        # -------------------------
+        # PRICE
+        # -------------------------
+
+        price_element = content.find(
+            "h3",
+            class_="css-yauxmy"
+        )
+
+        if price_element is not None:
+            price = price_element.get_text(
+                " ",
+                strip=True
+            )
+
+        # Fallback
+        if price is None:
+            price_container = content.find(
+                attrs={
+                    "data-testid": "ad-price-container"
+                }
+            )
+
+            if price_container is not None:
+                price = price_container.get_text(
+                    " ",
+                    strip=True
+                )
+
+        # -------------------------
+        # DESCRIPTION
+        # -------------------------
+
+        description_element = content.find(
+            attrs={
+                "data-cy": "ad_description"
+            }
+        )
+
+        if description_element is not None:
+            description = description_element.get_text(
+                "\n",
+                strip=True
+            )
+
+        # -------------------------
+        # VALIDATION
+        # -------------------------
+
+        if any(
+            item is None
+            for item in [
+                title,
+                price,
+                description
+            ]
+        ):
+            logging.warning(
+                f"Missing ad data for {ad_url}: "
+                f"title={title is not None}, "
+                f"price={price is not None}, "
+                f"description={description is not None}"
+            )
+
             return None
-        ad_data = {
+
+        return {
             "title": title,
             "price": price,
             "url": ad_url,
             "description": description
         }
-        return ad_data
