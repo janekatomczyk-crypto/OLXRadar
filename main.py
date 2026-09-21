@@ -2,6 +2,8 @@ import os
 import logging
 import logging_config
 from multiprocessing import Pool
+from urllib.parse import unquote
+
 from scraper_manager import OlxScraper
 from database_manager import DatabaseManager
 from notification_manager import Messenger
@@ -13,94 +15,149 @@ db = DatabaseManager()
 
 
 def load_target_urls() -> list:
-    """
-    Fetch the list of URLs to monitor from the file 'target_urls.txt',
-    which is located in the same directory as the script.
-
-    Returns:
-        list: list of URLs from which to collect data. If the
-        file does not exist, it creates it and returns an empty list.
-
-    """
     file_path = os.path.join(BASE_DIR, "target_urls.txt")
-    user_message = f"The file 'target_urls.txt' has been created. Add " \
-        + f"in it at least one URL to monitor for new ads. Add 1 URL per line."
+
+    user_message = (
+        "The file 'target_urls.txt' has been created. "
+        "Add in it at least one URL to monitor for new ads. "
+        "Add 1 URL per line."
+    )
+
     try:
         with open(file_path) as f:
-            target_urls = [line.strip() for line in f]
+            target_urls = [
+                line.strip()
+                for line in f
+                if line.strip()
+            ]
     except FileNotFoundError:
         logging.info(user_message)
         open(file_path, "w").close()
         target_urls = []
+
     if not target_urls:
         logging.info(user_message)
+
     return target_urls
 
 
 def get_new_ads_urls(all_urls: list) -> list:
-    """
-    Returns a list of new ad URLs (not found in the database). 
-
-    Args:
-        all_urls (list): list of URLs to be matched against the database.
-
-    Returns:
-        new_urls (list): List of URLs not found in the database.
-    """
-    new_urls = []
-    if all_urls:
-        for url in all_urls:
-            if not db.url_exists(url):
-                new_urls.append(url)
-    return new_urls
+    return [
+        url
+        for url in all_urls
+        if not db.url_exists(url)
+    ]
 
 
 def get_new_ads_urls_for_url(target_url: str) -> list:
-    """
-    Extracts ads for a specific URL and filters out previously processed ads.
-
-    Args:
-        target_url (str): A string representing the URL for which new ads should be retrieved.
-
-    Returns:
-        List[str]: A list of URLs representing new ads retrieved from the monitored URL.
-    """
-
     try:
         ads_urls = scraper.scrape_ads_urls(target_url)
     except ValueError as error:
         logging.error(error)
         return []
+
     return get_new_ads_urls(ads_urls)
 
 
+def ad_matches_search(target_url: str, ad: dict) -> bool:
+    """
+    Reject obviously incorrect OLX search results.
+    """
+
+    target = unquote(target_url).lower()
+    title = unquote(ad.get("title", "")).lower()
+
+    # PS5 Pro
+    if "ps5 pro" in target:
+        return (
+            "ps5 pro" in title
+            or "playstation 5 pro" in title
+        )
+
+    # Xbox Series X
+    if "xbox series x" in target:
+        return (
+            "series x" in title
+            and "series s" not in title
+        )
+
+    # Xbox Series S
+    if "xbox series s" in target:
+        return (
+            "series s" in title
+            and "xbox 360" not in title
+        )
+
+    # Standard PS5 search
+    if "/q-ps5/" in target:
+        has_ps5 = (
+            "ps5" in title
+            or "playstation 5" in title
+        )
+
+        has_ps4 = (
+            "ps4" in title
+            or "playstation 4" in title
+        )
+
+        return has_ps5 and not has_ps4
+
+    return True
+
+
 def main() -> None:
-    """
-    Main function. Collects and processes ads
-    and sends notifications by email and Telegram.
-    """
-
     target_urls = load_target_urls()
-    for target_url in target_urls:
-        ads_urls = get_new_ads_urls_for_url(target_url)
 
-        # Filter out the already processed ads
-        new_ads_urls = get_new_ads_urls(ads_urls)
+    for target_url in target_urls:
+        new_ads_urls = get_new_ads_urls_for_url(
+            target_url
+        )
+
         if not new_ads_urls:
             continue
 
-        # Process ads in parallel, for increased speed
         with Pool(10) as pool:
-            new_ads = pool.map(scraper.get_ad_data, new_ads_urls)
-        new_ads = list(filter(None, new_ads))
+            ads = pool.map(
+                scraper.get_ad_data,
+                new_ads_urls
+            )
 
-        if new_ads:
-            message_subject, message_body = Messenger.generate_email_content(
-                target_url, new_ads)
-            Messenger.send_email_message(message_subject, message_body)
-            Messenger.send_telegram_message(message_subject, message_body)
+        ads = list(filter(None, ads))
 
-        # Add the processed ads to database
+        matching_ads = [
+            ad
+            for ad in ads
+            if ad_matches_search(target_url, ad)
+        ]
+
+        rejected_count = len(ads) - len(matching_ads)
+
+        if rejected_count:
+            logging.info(
+                f"Rejected {rejected_count} "
+                f"irrelevant OLX ads."
+            )
+
+        if matching_ads:
+            message_subject, message_body = (
+                Messenger.generate_email_content(
+                    target_url,
+                    matching_ads
+                )
+            )
+
+            Messenger.send_email_message(
+                message_subject,
+                message_body
+            )
+
+            Messenger.send_telegram_message(
+                message_subject,
+                message_body
+            )
+
+        # Mark every processed URL as seen, including rejected ads.
+        # Otherwise irrelevant listings would be downloaded every run.
         for url in new_ads_urls:
             db.add_url(url)
 
